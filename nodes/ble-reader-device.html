@@ -1,0 +1,135 @@
+<script type="text/javascript">
+  RED.nodes.registerType('ble-reader-device', {
+    category: 'config',
+    defaults: {
+      name: { value: '' },
+      bluetooth: { value: 'auto' },
+      namePrefix: { value: '' },
+      serviceUuid: { value: '' },
+      notifyUuid: { value: 'fff1', required: true },
+      listenMs: { value: 5000, required: true, validate: RED.validators.number() },
+      targetMode: { value: 'all' },
+      deviceName: { value: '' }
+    },
+    label: function () {
+      return this.name || this.deviceName || 'BLE reader';
+    },
+    oneditprepare: function () {
+      var deviceSelect = $('#node-config-input-deviceNameSelect');
+      var deviceName = $('#node-config-input-deviceName');
+      var targetMode = $('#node-config-input-targetMode');
+      var searchButton = $('#node-config-input-search');
+      var searchStatus = $('#node-config-input-search-status');
+
+      function hasOption(value) {
+        var found = false;
+        deviceSelect.find('option').each(function () {
+          if ($(this).attr('value') === value) found = true;
+        });
+        return found;
+      }
+
+      function setSelected(mode, name) {
+        targetMode.val(mode);
+        deviceName.val(name || '');
+        deviceSelect.val(mode === 'all' ? '' : name);
+      }
+
+      function ensureCurrentOption() {
+        var currentName = deviceName.val();
+        if (currentName && !hasOption(currentName)) {
+          deviceSelect.append($('<option></option>').attr('value', currentName).text(currentName));
+        }
+        setSelected(targetMode.val() || (currentName ? 'name' : 'all'), currentName);
+      }
+
+      deviceSelect.on('change', function () {
+        var selected = deviceSelect.val();
+        setSelected(selected ? 'name' : 'all', selected);
+      });
+
+      searchButton.on('click', function () {
+        searchButton.prop('disabled', true);
+        searchStatus.text('searching...');
+        $.getJSON('ble-reader/devices', {
+          bluetooth: $('#node-config-input-bluetooth').val(),
+          namePrefix: $('#node-config-input-namePrefix').val(),
+          serviceUuid: $('#node-config-input-serviceUuid').val()
+        })
+          .done(function (devices) {
+            var previous = deviceName.val();
+            deviceSelect.empty();
+            deviceSelect.append($('<option></option>').attr('value', '').text('All discovered devices'));
+            devices.forEach(function (device) {
+              if (!device.name) return;
+              var details = device.address ? ' (' + device.address + ')' : '';
+              deviceSelect.append($('<option></option>').attr('value', device.name).text(device.name + details));
+            });
+            if (previous && hasOption(previous)) {
+              setSelected('name', previous);
+            } else {
+              setSelected('all', '');
+            }
+            searchStatus.text(devices.length + ' found');
+          })
+          .fail(function (xhr) {
+            var response = xhr.responseJSON || {};
+            searchStatus.text(response.error || 'search failed');
+          })
+          .always(function () {
+            searchButton.prop('disabled', false);
+          });
+      });
+
+      ensureCurrentOption();
+    }
+  });
+</script>
+
+<script type="text/html" data-template-name="ble-reader-device">
+  <div class="form-row">
+    <label for="node-config-input-name"><i class="fa fa-tag"></i> Name</label>
+    <input type="text" id="node-config-input-name">
+  </div>
+  <div class="form-row">
+    <label for="node-config-input-bluetooth"><i class="fa fa-bluetooth"></i> Bluetooth</label>
+    <select id="node-config-input-bluetooth">
+      <option value="auto">auto</option>
+      <option value="bluez">bluez</option>
+      <option value="noble">noble</option>
+    </select>
+  </div>
+  <div class="form-row">
+    <label for="node-config-input-namePrefix"><i class="fa fa-filter"></i> Name prefix</label>
+    <input type="text" id="node-config-input-namePrefix" placeholder="optional">
+  </div>
+  <div class="form-row">
+    <label for="node-config-input-serviceUuid"><i class="fa fa-filter"></i> Service UUID</label>
+    <input type="text" id="node-config-input-serviceUuid" placeholder="optional">
+  </div>
+  <div class="form-row">
+    <label for="node-config-input-notifyUuid"><i class="fa fa-bell"></i> Notify UUID</label>
+    <input type="text" id="node-config-input-notifyUuid" placeholder="fff1">
+  </div>
+  <div class="form-row">
+    <label for="node-config-input-listenMs"><i class="fa fa-clock-o"></i> Listen ms</label>
+    <input type="number" id="node-config-input-listenMs" min="0" step="100">
+  </div>
+  <div class="form-row">
+    <label for="node-config-input-deviceNameSelect"><i class="fa fa-search"></i> Device</label>
+    <select id="node-config-input-deviceNameSelect" style="width:60%;">
+      <option value="">All discovered devices</option>
+    </select>
+    <button type="button" id="node-config-input-search" class="red-ui-button" style="margin-left:4px;">Search</button>
+    <input type="hidden" id="node-config-input-targetMode">
+    <input type="hidden" id="node-config-input-deviceName">
+  </div>
+  <div class="form-row">
+    <label></label>
+    <span id="node-config-input-search-status" style="color:#666;"></span>
+  </div>
+</script>
+
+<script type="text/html" data-help-name="ble-reader-device">
+  <p>Configures BLE discovery and the notification characteristic used by the raw reader.</p>
+</script>

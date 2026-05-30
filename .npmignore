@@ -1,0 +1,6 @@
+captures/
+node_modules/
+*.log
+*.tgz
+.npm-cache/
+.github/

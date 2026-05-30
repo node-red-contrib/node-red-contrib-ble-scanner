@@ -1,0 +1,38 @@
+<script type="text/javascript">
+  RED.nodes.registerType('ble-reader-read', {
+    category: 'BLE',
+    color: '#d8eef8',
+    defaults: {
+      name: { value: '' },
+      device: { type: 'ble-reader-device', required: true },
+      listenMs: { value: 0, validate: RED.validators.number() }
+    },
+    inputs: 1,
+    outputs: 1,
+    icon: 'font-awesome/fa-bluetooth',
+    label: function () {
+      return this.name || 'BLE read';
+    }
+  });
+</script>
+
+<script type="text/html" data-template-name="ble-reader-read">
+  <div class="form-row">
+    <label for="node-input-name"><i class="fa fa-tag"></i> Name</label>
+    <input type="text" id="node-input-name">
+  </div>
+  <div class="form-row">
+    <label for="node-input-device"><i class="fa fa-bluetooth"></i> Device</label>
+    <input type="text" id="node-input-device">
+  </div>
+  <div class="form-row">
+    <label for="node-input-listenMs"><i class="fa fa-clock-o"></i> Listen ms</label>
+    <input type="number" id="node-input-listenMs" min="0" step="100" placeholder="use config">
+  </div>
+</script>
+
+<script type="text/html" data-help-name="ble-reader-read">
+  <p>Collects raw BLE notifications. Output <code>msg.payload</code> is an array with one entry per matching device.</p>
+  <p>Each message contains <code>data</code> as a Buffer plus <code>hex</code>, <code>base64</code>, <code>bytes</code>, <code>length</code>, and <code>timestamp</code>.</p>
+  <p>Incoming <code>msg.payload</code> may contain <code>{ deviceName, listenMs, serviceUuid, notifyUuid }</code> to override the configured values.</p>
+</script>

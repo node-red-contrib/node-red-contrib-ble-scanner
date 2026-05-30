@@ -1,0 +1,73 @@
+{
+  "name": "node-red-contrib-ble-scanner",
+  "version": "0.0.1",
+  "description": "Generic Node-RED BLE reader for raw notification messages.",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/node-red-contrib/node-red-contrib-ble-scanner.git"
+  },
+  "bugs": {
+    "url": "https://github.com/node-red-contrib/node-red-contrib-ble-scanner/issues"
+  },
+  "homepage": "https://github.com/node-red-contrib/node-red-contrib-ble-scanner#readme",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": [
+    "bin",
+    "dist",
+    "nodes",
+    "README.md",
+    "LICENSE"
+  ],
+  "bin": {
+    "ble-reader": "bin/ble-reader.js"
+  },
+  "node-red": {
+    "version": ">=4.0.0",
+    "nodes": {
+      "ble-reader-device": "nodes/ble-reader-device.js",
+      "ble-reader-read": "nodes/ble-reader-read.js"
+    }
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "clean": "tsc -p tsconfig.json --build --clean",
+    "discover": "npm run build --silent && node ./bin/ble-reader.js discover",
+    "read": "npm run build --silent && node ./bin/ble-reader.js read",
+    "lint": "eslint .",
+    "check": "npm run build && npm run lint && npm test",
+    "test": "npm run build --silent && node --test"
+  },
+  "dependencies": {
+    "commander": "^14.0.3",
+    "dbus-next": "^0.10.2"
+  },
+  "optionalDependencies": {
+    "@abandonware/noble": "1.9.2-26"
+  },
+  "devDependencies": {
+    "@eslint/js": "^10.0.1",
+    "@types/node": "^25.6.0",
+    "eslint": "^10.3.0",
+    "typescript": "^6.0.3",
+    "typescript-eslint": "^8.59.1"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "keywords": [
+    "node-red",
+    "bluetooth",
+    "ble",
+    "scanner",
+    "notifications"
+  ],
+  "license": "MIT"
+}

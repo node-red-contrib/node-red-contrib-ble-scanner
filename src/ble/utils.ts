@@ -1,5 +1,5 @@
 import { DEFAULTS } from '../constants.js';
-import type { BleDiscoveredDevice } from './backend.js';
+import type { BleDiscoveredDevice, BleManufacturerData, RawBleMessage } from './backend.js';
 
 export function normalizeUuid(uuid: string | null | undefined): string {
   const compact = String(uuid || '').toLowerCase().replaceAll('-', '');
@@ -68,4 +68,30 @@ export function errorMessage(error: unknown): string {
 
 export function asError(error: unknown): Error {
   return error instanceof Error ? error : new Error(String(error));
+}
+
+export function createManufacturerData(companyId: string | number, data: Buffer): BleManufacturerData {
+  const normalizedCompanyId = typeof companyId === 'number' ? String(companyId) : companyId;
+  const numericCompanyId = Number(normalizedCompanyId);
+  const companyIdHex = Number.isFinite(numericCompanyId)
+    ? numericCompanyId.toString(16).padStart(4, '0')
+    : String(normalizedCompanyId).toLowerCase();
+
+  return {
+    companyId: normalizedCompanyId,
+    companyIdHex,
+    length: data.length,
+    data,
+    hex: data.toString('hex'),
+    base64: data.toString('base64'),
+    bytes: [...data]
+  };
+}
+
+export function createRawManufacturerMessage(companyId: string | number, data: Buffer): RawBleMessage {
+  return {
+    ...createManufacturerData(companyId, data),
+    timestamp: new Date().toISOString(),
+    source: 'manufacturerData'
+  };
 }

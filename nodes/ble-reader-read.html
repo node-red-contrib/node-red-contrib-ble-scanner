@@ -11,7 +11,7 @@
     outputs: 1,
     icon: 'font-awesome/fa-bluetooth',
     label: function () {
-      return this.name || 'BLE read';
+      return this.name || 'BLE advertisement read';
     }
   });
 </script>
@@ -32,7 +32,7 @@
 </script>
 
 <script type="text/html" data-help-name="ble-reader-read">
-  <p>Collects raw BLE notifications. Output <code>msg.payload</code> is an array with one entry per matching device.</p>
-  <p>Each message contains <code>data</code> as a Buffer plus <code>hex</code>, <code>base64</code>, <code>bytes</code>, <code>length</code>, and <code>timestamp</code>.</p>
-  <p>Incoming <code>msg.payload</code> may contain <code>{ deviceName, listenMs, serviceUuid, notifyUuid }</code> to override the configured values.</p>
+  <p>Collects raw BLE advertisement manufacturer data. Output <code>msg.payload</code> is an array with one entry per matching device.</p>
+  <p>Each message contains <code>companyId</code>, <code>companyIdHex</code>, <code>data</code> as a Buffer plus <code>hex</code>, <code>base64</code>, <code>bytes</code>, <code>length</code>, and <code>timestamp</code>.</p>
+  <p>Incoming <code>msg.payload</code> may contain <code>{ deviceName, listenMs, serviceUuid }</code> to override the configured values.</p>
 </script>

@@ -16,16 +16,14 @@ module.exports = function registerBleReaderReadNode(RED) {
         const deviceName = override.deviceName || (node.device.targetMode === 'name' ? node.device.deviceName : undefined);
         const listenMs = override.listenMs ?? (node.listenMs || node.device.listenMs);
         const serviceUuid = override.serviceUuid ?? node.device.serviceUuid;
-        const notifyUuid = override.notifyUuid ?? node.device.notifyUuid;
 
-        node.status({ fill: 'yellow', shape: 'ring', text: 'listening' });
+        node.status({ fill: 'yellow', shape: 'ring', text: 'scanning' });
         const result = await node.device.enqueue((ble) =>
           ble.readDevices({
             bluetooth: node.device.bluetooth,
             namePrefix: node.device.namePrefix,
             deviceName,
             listenMs,
-            notifyUuid,
             scanServiceUuid: serviceUuid || null,
             matchServiceUuid: serviceUuid || null
           })
@@ -50,7 +48,6 @@ function normalizePayload(payload) {
   const result = {};
   if (typeof payload.deviceName === 'string' && payload.deviceName) result.deviceName = payload.deviceName;
   if (typeof payload.serviceUuid === 'string') result.serviceUuid = payload.serviceUuid;
-  if (typeof payload.notifyUuid === 'string' && payload.notifyUuid) result.notifyUuid = payload.notifyUuid;
   if (payload.listenMs !== undefined) {
     const listenMs = Number(payload.listenMs);
     if (Number.isFinite(listenMs) && listenMs >= 0) result.listenMs = listenMs;

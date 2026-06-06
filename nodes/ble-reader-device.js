@@ -11,7 +11,6 @@ module.exports = function registerBleReaderDeviceNode(RED) {
     node.bluetooth = config.bluetooth || 'auto';
     node.namePrefix = config.namePrefix || '';
     node.serviceUuid = config.serviceUuid || '';
-    node.notifyUuid = config.notifyUuid || 'fff1';
     node.listenMs = Number(config.listenMs || 5000);
     node.targetMode = config.targetMode || 'all';
     node.deviceName = config.deviceName || '';

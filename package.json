@@ -1,7 +1,7 @@
 {
   "name": "node-red-contrib-ble-scanner",
-  "version": "0.0.1",
-  "description": "Generic Node-RED BLE reader for raw notification messages.",
+  "version": "0.1.0",
+  "description": "Generic Node-RED BLE scanner for raw advertisement manufacturer data.",
   "type": "module",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
@@ -67,7 +67,8 @@
     "bluetooth",
     "ble",
     "scanner",
-    "notifications"
+    "advertisements",
+    "manufacturer-data"
   ],
   "license": "MIT"
 }

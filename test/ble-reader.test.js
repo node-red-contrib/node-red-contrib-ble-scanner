@@ -12,13 +12,12 @@ test('matches BLE devices by exact name, prefix, service UUID, or no filters', (
   assert.equal(matchesBleDevice({ name: 'Other' }, { namePrefix: '', serviceUuid: null }), true);
 });
 
-test('parses CLI read options for raw notification capture', () => {
+test('parses CLI read options for raw advertisement capture', () => {
   const options = toReadOptions(
     {
       bluetooth: 'noble',
       namePrefix: 'SK',
       serviceUuid: 'fff0',
-      notifyUuid: 'fff1',
       listenMs: '2500',
       debug: false
     },
@@ -30,7 +29,6 @@ test('parses CLI read options for raw notification capture', () => {
   assert.equal(options.deviceName, 'SK12V324PH00057');
   assert.equal(options.scanServiceUuid, 'fff0');
   assert.equal(options.matchServiceUuid, 'fff0');
-  assert.equal(options.notifyUuid, 'fff1');
   assert.equal(options.listenMs, 2500);
 });
 

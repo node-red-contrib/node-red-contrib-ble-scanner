@@ -1,8 +1,25 @@
 import { createRequire } from 'node:module';
 import { setTimeout as delay } from 'node:timers/promises';
 
-import type { BleCharacteristic, BleDiscoveredDevice, BleSession, BluetoothBackend, Logger, ResolvedConnectOptions, ResolvedDiscoverOptions } from './backend.js';
-import { errorMessage, formatCanonicalUuid, matchesBleDevice, normalizeUuid, nullableNumber, nullableString, unboxBluezValue, uniqueDevices } from './utils.js';
+import type {
+  BleDiscoveredDevice,
+  BluetoothBackend,
+  Logger,
+  ResolvedDiscoverOptions,
+  ResolvedScanOptions
+} from './backend.js';
+import {
+  createManufacturerData,
+  createRawManufacturerMessage,
+  errorMessage,
+  formatCanonicalUuid,
+  matchesBleDevice,
+  nullableNumber,
+  nullableString,
+  normalizeUuid,
+  unboxBluezValue,
+  uniqueDevices
+} from './utils.js';
 
 type BluezObjects = Record<string, Record<string, Record<string, unknown>>>;
 type BluezVariantConstructor = new (signature: string, value: unknown) => unknown;
@@ -14,6 +31,8 @@ interface BluezBus {
 
 interface BluezObjectManager {
   GetManagedObjects(): Promise<BluezObjects>;
+  on?(event: 'InterfacesAdded', listener: (path: string, interfaces: Record<string, Record<string, unknown>>) => void): void;
+  removeListener?(event: 'InterfacesAdded', listener: (path: string, interfaces: Record<string, Record<string, unknown>>) => void): void;
 }
 
 interface BluezAdapter {
@@ -22,34 +41,30 @@ interface BluezAdapter {
   SetDiscoveryFilter(filter: Record<string, unknown>): Promise<void>;
 }
 
-interface BluezDevice {
-  Connect(): Promise<void>;
-  Disconnect(): Promise<void>;
-}
-
-interface BluezCharacteristic {
-  ReadValue(options: Record<string, unknown>): Promise<number[]>;
-  WriteValue(value: number[], options: Record<string, unknown>): Promise<void>;
-  StartNotify(): Promise<void>;
-}
-
 interface BluezProperties {
-  Get(interfaceName: string, propertyName: string): Promise<unknown>;
   on(event: 'PropertiesChanged', listener: (interfaceName: string, changed: Record<string, unknown>, invalidated: string[]) => void): void;
   removeListener(event: 'PropertiesChanged', listener: (interfaceName: string, changed: Record<string, unknown>, invalidated: string[]) => void): void;
 }
 
-const requireOptional = createRequire(import.meta.url);
-const DISCOVERY_POLL_MS = 500;
+interface DeviceWatcher {
+  properties: BluezProperties;
+  listener: (interfaceName: string, changed: Record<string, unknown>, invalidated: string[]) => void;
+}
 
-let activeSessions = new Set<BleSession>();
+const requireOptional = createRequire(import.meta.url);
+const BLUEZ_SERVICE = 'org.bluez';
+const DBUS_OBJECT_MANAGER = 'org.freedesktop.DBus.ObjectManager';
+const DBUS_PROPERTIES = 'org.freedesktop.DBus.Properties';
+const BLUEZ_ADAPTER = 'org.bluez.Adapter1';
+const BLUEZ_DEVICE = 'org.bluez.Device1';
+const DISCOVERY_POLL_MS = 500;
 
 export const bluezBackend: BluetoothBackend = {
   name: 'bluez',
   isAvailable: isBluezAvailable,
   discover: discoverBluezDevices,
-  connect: connectBluezDevice,
-  shutdown: shutdownBluez
+  scanAdvertisements: scanBluezAdvertisements,
+  shutdown: async () => {}
 };
 
 async function isBluezAvailable(logger: Logger = () => {}): Promise<boolean> {
@@ -58,8 +73,8 @@ async function isBluezAvailable(logger: Logger = () => {}): Promise<boolean> {
     const { systemBus } = loadDbusNext();
     const bus = systemBus();
     try {
-      const object = await bus.getProxyObject('org.bluez', '/');
-      const objectManager = object.getInterface('org.freedesktop.DBus.ObjectManager') as BluezObjectManager;
+      const object = await bus.getProxyObject(BLUEZ_SERVICE, '/');
+      const objectManager = object.getInterface(DBUS_OBJECT_MANAGER) as BluezObjectManager;
       const objects = await objectManager.GetManagedObjects();
       return findBluezAdapterPath(objects) !== null;
     } finally {
@@ -72,226 +87,165 @@ async function isBluezAvailable(logger: Logger = () => {}): Promise<boolean> {
 }
 
 async function discoverBluezDevices(options: ResolvedDiscoverOptions): Promise<BleDiscoveredDevice[]> {
+  const devices = new Map<string, BleDiscoveredDevice>();
+  await runBluezScan({
+    timeoutMs: options.timeoutMs,
+    scanServiceUuid: options.scanServiceUuid,
+    logger: options.logger,
+    onDevice: (device) => {
+      if (matchesDiscoveredDevice(device, options)) devices.set(deviceKey(device), device);
+    }
+  });
+  return uniqueDevices([...devices.values()]);
+}
+
+async function scanBluezAdvertisements(options: ResolvedScanOptions): Promise<void> {
+  await runBluezScan({
+    timeoutMs: options.listenMs,
+    scanServiceUuid: options.scanServiceUuid,
+    logger: options.logger,
+    onAdvertisement: (device, payload) => {
+      if (!matchesDiscoveredDevice(device, options)) return;
+      options.onAdvertisement({
+        device,
+        message: createRawManufacturerMessage(payload.companyId, payload.data)
+      });
+    }
+  });
+}
+
+async function runBluezScan({
+  timeoutMs,
+  scanServiceUuid,
+  logger,
+  onDevice,
+  onAdvertisement
+}: {
+  timeoutMs: number;
+  scanServiceUuid: string | null;
+  logger: Logger;
+  onDevice?: (device: BleDiscoveredDevice) => void;
+  onAdvertisement?: (device: BleDiscoveredDevice, payload: { companyId: string; data: Buffer }) => void;
+}): Promise<void> {
   if (process.platform !== 'linux') throw new Error('BlueZ backend is only available on Linux.');
   const { systemBus, Variant } = loadDbusNext();
   const bus = systemBus();
+  const deviceProperties = new Map<string, Record<string, unknown>>();
+  const deviceWatchers = new Map<string, DeviceWatcher>();
+  const lastManufacturerData = new Map<string, string>();
+  let pollTimer: NodeJS.Timeout | null = null;
+  let polling = false;
+
+  const processDeviceProperties = (path: string, properties: Record<string, unknown>) => {
+    const merged = { ...(deviceProperties.get(path) || {}), ...properties };
+    deviceProperties.set(path, merged);
+
+    const device = toDiscoveredDevice(path, merged, 'bluez');
+    onDevice?.(device);
+
+    for (const payload of readManufacturerData(merged.ManufacturerData)) {
+      const key = `${path}:${payload.companyId}`;
+      const hex = payload.data.toString('hex');
+      if (lastManufacturerData.get(key) === hex) continue;
+      lastManufacturerData.set(key, hex);
+
+      const advertisedDevice = toDiscoveredDevice(path, { ...merged, ManufacturerData: new Map([[payload.companyId, payload.data]]) }, 'bluez');
+      onAdvertisement?.(advertisedDevice, payload);
+    }
+  };
+
+  const watchDeviceProperties = async (path: string) => {
+    if (deviceWatchers.has(path)) return;
+    try {
+      const object = await bus.getProxyObject(BLUEZ_SERVICE, path);
+      const properties = object.getInterface(DBUS_PROPERTIES) as BluezProperties;
+      const listener = (interfaceName: string, changed: Record<string, unknown>) => {
+        if (interfaceName === BLUEZ_DEVICE) processDeviceProperties(path, changed);
+      };
+      properties.on('PropertiesChanged', listener);
+      deviceWatchers.set(path, { properties, listener });
+    } catch (error) {
+      logger(`Warning: could not watch BlueZ properties for ${path}: ${errorMessage(error)}.`);
+    }
+  };
+
+  const processInterfaces = (path: string, interfaces: Record<string, Record<string, unknown>>) => {
+    const device = interfaces[BLUEZ_DEVICE];
+    if (!device) return;
+    void watchDeviceProperties(path);
+    processDeviceProperties(path, device);
+  };
 
   try {
     const { objectManager, adapter } = await openBluezAdapter(bus);
-    const canonicalScanServiceUuid = options.scanServiceUuid ? formatCanonicalUuid(options.scanServiceUuid) : null;
-    if (options.deviceName) {
-      const cachedMatches = uniqueDevices(findBluezDevices(await objectManager.GetManagedObjects(), options));
-      if (cachedMatches.length > 0) {
-        options.logger(`BlueZ found ${cachedMatches[0].name || cachedMatches[0].address || cachedMatches[0].id} in managed objects.`);
-        return cachedMatches;
-      }
-    }
+    const onInterfacesAdded = (path: string, interfaces: Record<string, Record<string, unknown>>) => processInterfaces(path, interfaces);
+    objectManager.on?.('InterfacesAdded', onInterfacesAdded);
 
-    await setBluezDiscoveryFilter(adapter, Variant, canonicalScanServiceUuid, options.logger);
-    await adapter.StartDiscovery();
-    options.logger(`BlueZ discovery started. Waiting ${options.timeoutMs}ms.`);
-
-    const devices: BleDiscoveredDevice[] = [];
-    const startedAt = Date.now();
-    try {
-      while (Date.now() - startedAt < options.timeoutMs) {
+    const pollManagedObjects = async () => {
+      if (polling) return;
+      polling = true;
+      try {
         const objects = await objectManager.GetManagedObjects();
-        devices.push(...findBluezDevices(objects, options));
-        if (options.deviceName && devices.length > 0) break;
-        await delay(DISCOVERY_POLL_MS);
+        for (const [path, interfaces] of Object.entries(objects)) processInterfaces(path, interfaces);
+      } finally {
+        polling = false;
       }
-    } finally {
-      await adapter.StopDiscovery().catch((error: unknown) => options.logger(`Warning: could not stop BlueZ discovery: ${errorMessage(error)}.`));
-    }
+    };
 
-    return uniqueDevices(devices);
+    try {
+      await setBluezDiscoveryFilter(adapter, Variant, scanServiceUuid, true, logger);
+      await adapter.StartDiscovery();
+      logger(`BlueZ advertisement scan started. Listening ${timeoutMs}ms.`);
+      await pollManagedObjects();
+      pollTimer = setInterval(() => {
+        void pollManagedObjects().catch((error: unknown) => logger(`Warning: could not poll BlueZ devices: ${errorMessage(error)}.`));
+      }, DISCOVERY_POLL_MS);
+      await delay(timeoutMs);
+    } finally {
+      if (pollTimer) clearInterval(pollTimer);
+      objectManager.removeListener?.('InterfacesAdded', onInterfacesAdded);
+      for (const { properties, listener } of deviceWatchers.values()) properties.removeListener('PropertiesChanged', listener);
+      await adapter.StopDiscovery().catch((error: unknown) => logger(`Warning: could not stop BlueZ discovery: ${errorMessage(error)}.`));
+    }
   } finally {
     bus.disconnect();
   }
 }
 
-async function connectBluezDevice({ device, timeoutMs, connectTimeoutMs, notifyUuid, logger }: ResolvedConnectOptions): Promise<BleSession> {
-  if (process.platform !== 'linux') throw new Error('BlueZ backend is only available on Linux.');
-  const { systemBus } = loadDbusNext();
-  const bus = systemBus();
-
-  try {
-    const objectManagerObject = await bus.getProxyObject('org.bluez', '/');
-    const objectManager = objectManagerObject.getInterface('org.freedesktop.DBus.ObjectManager') as BluezObjectManager;
-    let objects = await objectManager.GetManagedObjects();
-    let target = findBluezDeviceByDiscovered(objects, device);
-
-    if (!target) {
-      const matches = await discoverBluezDevices({
-        namePrefix: '',
-        deviceName: device.name,
-        timeoutMs,
-        scanServiceUuid: null,
-        matchServiceUuid: null,
-        logger
-      });
-      const refreshed = matches.find((match) => match.name === device.name || match.address === device.address || match.id === device.id);
-      if (!refreshed) throw new Error(`Could not rediscover ${device.name || device.address || device.id}.`);
-      objects = await objectManager.GetManagedObjects();
-      target = findBluezDeviceByDiscovered(objects, refreshed);
-    }
-
-    if (!target) throw new Error(`Could not find ${device.name || device.address || device.id} in BlueZ managed objects.`);
-    logger(`BlueZ connecting to ${target.address || '<unknown address>'} at ${target.path}.`);
-
-    const deviceObject = await bus.getProxyObject('org.bluez', target.path);
-    const bluezDevice = deviceObject.getInterface('org.bluez.Device1') as BluezDevice;
-    const deviceProperties = deviceObject.getInterface('org.freedesktop.DBus.Properties') as BluezProperties;
-    if (!(await getBluezBoolean(deviceProperties, 'org.bluez.Device1', 'Connected'))) {
-      await withTimeout(bluezDevice.Connect(), connectTimeoutMs, 'BlueZ Device1.Connect()');
-    }
-    await waitForBluezBooleanProperty(deviceProperties, 'org.bluez.Device1', 'ServicesResolved', true, timeoutMs);
-    logger('BlueZ connected and services resolved.');
-
-    const refreshedObjects = await objectManager.GetManagedObjects();
-    const characteristics = await buildBluezCharacteristics({ bus, objects: refreshedObjects, devicePath: target.path, notifyUuid, logger });
-    await characteristics.notify.subscribe();
-    logger(`Subscribed to BLE notification characteristic ${characteristics.notify.uuid} via BlueZ.`);
-
-    const session: BleSession = {
-      device: toDiscoveredDevice(target.path, refreshedObjects[target.path]?.['org.bluez.Device1'] || {}, 'bluez'),
-      notify: characteristics.notify,
-      disconnect: async () => {
-        activeSessions.delete(session);
-        await bluezDevice.Disconnect().catch(() => {});
-        bus.disconnect();
-      }
-    };
-    activeSessions.add(session);
-    return session;
-  } catch (error) {
-    bus.disconnect();
-    throw error;
-  }
-}
-
 async function openBluezAdapter(bus: BluezBus): Promise<{ objectManager: BluezObjectManager; adapter: BluezAdapter; adapterPath: string }> {
-  const objectManagerObject = await bus.getProxyObject('org.bluez', '/');
-  const objectManager = objectManagerObject.getInterface('org.freedesktop.DBus.ObjectManager') as BluezObjectManager;
+  const objectManagerObject = await bus.getProxyObject(BLUEZ_SERVICE, '/');
+  const objectManager = objectManagerObject.getInterface(DBUS_OBJECT_MANAGER) as BluezObjectManager;
   const objects = await objectManager.GetManagedObjects();
   const adapterPath = findBluezAdapterPath(objects);
   if (!adapterPath) throw new Error('Could not find a BlueZ adapter via org.bluez ObjectManager.');
-  const adapterObject = await bus.getProxyObject('org.bluez', adapterPath);
-  const adapter = adapterObject.getInterface('org.bluez.Adapter1') as BluezAdapter;
+  const adapterObject = await bus.getProxyObject(BLUEZ_SERVICE, adapterPath);
+  const adapter = adapterObject.getInterface(BLUEZ_ADAPTER) as BluezAdapter;
   return { objectManager, adapter, adapterPath };
-}
-
-async function buildBluezCharacteristics({
-  bus,
-  objects,
-  devicePath,
-  notifyUuid,
-  logger
-}: {
-  bus: BluezBus;
-  objects: BluezObjects;
-  devicePath: string;
-  notifyUuid: string;
-  logger: Logger;
-}): Promise<{ notify: BleCharacteristic }> {
-  const byUuid = new Map<string, { path: string; properties: Record<string, unknown> }>();
-
-  for (const [path, interfaces] of Object.entries(objects)) {
-    if (!path.startsWith(`${devicePath}/`)) continue;
-    const characteristic = interfaces['org.bluez.GattCharacteristic1'];
-    if (!characteristic) continue;
-    const uuid = nullableString(unboxBluezValue(characteristic.UUID));
-    if (!uuid) continue;
-    byUuid.set(normalizeUuid(uuid), { path, properties: characteristic });
-  }
-
-  logger(`BlueZ discovered ${byUuid.size} GATT characteristic(s): ${[...byUuid.keys()].sort().join(', ')}.`);
-  const notify = byUuid.get(normalizeUuid(notifyUuid));
-  if (!notify) {
-    throw new Error(`Missing BLE notify characteristic ${notifyUuid} via BlueZ. Found: ${[...byUuid.keys()].sort().join(', ')}`);
-  }
-
-  return {
-    notify: await wrapBluezCharacteristic(bus, notify.path, notify.properties)
-  };
-}
-
-async function wrapBluezCharacteristic(bus: BluezBus, path: string, initialProperties: Record<string, unknown>): Promise<BleCharacteristic> {
-  const object = await bus.getProxyObject('org.bluez', path);
-  const characteristic = object.getInterface('org.bluez.GattCharacteristic1') as BluezCharacteristic;
-  const properties = object.getInterface('org.freedesktop.DBus.Properties') as BluezProperties;
-  const listeners = new Set<(data: Buffer) => void>();
-  const flags = Array.isArray(unboxBluezValue(initialProperties.Flags)) ? (unboxBluezValue(initialProperties.Flags) as unknown[]).map(String) : [];
-  let writeQueue = Promise.resolve();
-
-  const onPropertiesChanged = (interfaceName: string, changed: Record<string, unknown>) => {
-    if (interfaceName !== 'org.bluez.GattCharacteristic1' || !('Value' in changed)) return;
-    const value = Buffer.from((unboxBluezValue(changed.Value) as number[]) || []);
-    for (const listener of listeners) listener(value);
-  };
-
-  properties.on('PropertiesChanged', onPropertiesChanged);
-
-  return {
-    uuid: normalizeUuid(String(unboxBluezValue(initialProperties.UUID) || '')),
-    properties: flags,
-    async write(data, withoutResponse = false) {
-      const options = withoutResponse ? { type: new (loadDbusNext().Variant)('s', 'command') } : {};
-      writeQueue = writeQueue.then(() => writeBluezValueWithRetry(characteristic, [...data], options));
-      await writeQueue;
-    },
-    async subscribe() {
-      await characteristic.StartNotify();
-    },
-    onData(listener) {
-      listeners.add(listener);
-    },
-    removeDataListener(listener) {
-      listeners.delete(listener);
-    }
-  };
 }
 
 function findBluezAdapterPath(objects: BluezObjects): string | null {
   for (const [path, interfaces] of Object.entries(objects)) {
-    if (interfaces['org.bluez.Adapter1']) return path;
+    if (interfaces[BLUEZ_ADAPTER]) return path;
   }
   return null;
 }
 
-function findBluezDevices(objects: BluezObjects, options: ResolvedDiscoverOptions): BleDiscoveredDevice[] {
-  const devices: BleDiscoveredDevice[] = [];
-  for (const [path, interfaces] of Object.entries(objects)) {
-    const device = interfaces['org.bluez.Device1'];
-    if (!device) continue;
-    const uuids = readBluezUuids(device);
-    const discovered = toDiscoveredDevice(path, device, 'bluez');
-    if (matchesBleDevice({ name: discovered.name, address: discovered.address, serviceUuids: uuids }, { namePrefix: options.namePrefix, deviceName: options.deviceName, serviceUuid: options.matchServiceUuid })) {
-      devices.push(discovered);
-    }
-  }
-  return devices;
-}
-
-function findBluezDeviceByDiscovered(objects: BluezObjects, selected: BleDiscoveredDevice): { path: string; address: string | null } | null {
-  for (const [path, interfaces] of Object.entries(objects)) {
-    const device = interfaces['org.bluez.Device1'];
-    if (!device) continue;
-    const discovered = toDiscoveredDevice(path, device, 'bluez');
-    if (selected.id === path || (!!selected.name && selected.name === discovered.name) || (!!selected.address && selected.address.toUpperCase() === discovered.address?.toUpperCase())) {
-      return { path, address: discovered.address };
-    }
-  }
-  return null;
+function matchesDiscoveredDevice(device: BleDiscoveredDevice, options: ResolvedDiscoverOptions): boolean {
+  return matchesBleDevice(
+    { name: device.name, address: device.address, serviceUuids: device.serviceUuids },
+    { namePrefix: options.namePrefix, deviceName: options.deviceName, serviceUuid: options.matchServiceUuid }
+  );
 }
 
 function toDiscoveredDevice(path: string, device: Record<string, unknown>, backend: 'bluez'): BleDiscoveredDevice {
   return {
     id: path,
     address: nullableString(unboxBluezValue(device.Address)),
-    addressType: null,
+    addressType: nullableString(unboxBluezValue(device.AddressType)),
     name: nullableString(unboxBluezValue(device.Name)) || nullableString(unboxBluezValue(device.Alias)),
     rssi: nullableNumber(unboxBluezValue(device.RSSI)),
+    serviceUuids: readBluezUuids(device),
+    manufacturerData: readManufacturerData(device.ManufacturerData).map((payload) => createManufacturerData(payload.companyId, payload.data)),
     backend
   };
 }
@@ -301,76 +255,52 @@ function readBluezUuids(device: Record<string, unknown>): string[] {
   return Array.isArray(value) ? value.map((uuid) => String(uuid)) : [];
 }
 
-export async function setBluezDiscoveryFilter(adapter: BluezAdapter, Variant: BluezVariantConstructor, serviceUuid: string | null, logger: Logger): Promise<void> {
+function readManufacturerData(value: unknown): Array<{ companyId: string; data: Buffer }> {
+  const data = unboxBluezValue(value);
+  if (!data || typeof data !== 'object') return [];
+
+  const entries = data instanceof Map ? Array.from(data.entries()) : Object.entries(data as Record<string, unknown>);
+  const payloads: Array<{ companyId: string; data: Buffer }> = [];
+
+  for (const [companyId, bytes] of entries) {
+    const buffer = bytesToBuffer(bytes);
+    if (buffer && buffer.length > 0) payloads.push({ companyId: String(companyId), data: buffer });
+  }
+
+  return payloads;
+}
+
+function bytesToBuffer(value: unknown): Buffer | null {
+  const unboxed = unboxBluezValue(value);
+  if (Buffer.isBuffer(unboxed)) return unboxed;
+  if (unboxed instanceof Uint8Array) return Buffer.from(unboxed);
+  if (Array.isArray(unboxed) && unboxed.every((byte) => typeof byte === 'number')) return Buffer.from(unboxed);
+  return null;
+}
+
+export async function setBluezDiscoveryFilter(
+  adapter: BluezAdapter,
+  Variant: BluezVariantConstructor,
+  serviceUuid: string | null,
+  duplicateData: boolean,
+  logger: Logger
+): Promise<void> {
   const filter: Record<string, unknown> = {
     Transport: new Variant('s', 'le'),
-    DuplicateData: new Variant('b', false)
+    DuplicateData: new Variant('b', duplicateData)
   };
-  if (serviceUuid) filter.UUIDs = new Variant('as', [serviceUuid]);
+  if (serviceUuid) filter.UUIDs = new Variant('as', [formatCanonicalUuid(serviceUuid)]);
 
-  const names = ['transport', 'duplicates'];
-  if (serviceUuid) names.push('service UUID');
+  const names = ['transport', duplicateData ? 'duplicate advertisement data' : 'deduplicated advertisement data'];
+  if (serviceUuid) names.push(`service UUID ${normalizeUuid(serviceUuid)}`);
 
   await adapter.SetDiscoveryFilter(filter)
     .then(() => logger(`BlueZ discovery filter applied: ${names.join(', ')}.`))
     .catch((error: unknown) => logger(`Warning: could not set BlueZ discovery filter (${names.join(', ')}): ${errorMessage(error)}.`));
 }
 
-async function getBluezBoolean(properties: BluezProperties, interfaceName: string, propertyName: string): Promise<boolean | null> {
-  const value = await properties.Get(interfaceName, propertyName).catch(() => null);
-  const unboxed = unboxBluezValue(value);
-  return typeof unboxed === 'boolean' ? unboxed : null;
-}
-
-async function waitForBluezBooleanProperty(properties: BluezProperties, interfaceName: string, propertyName: string, expected: boolean, timeoutMs: number): Promise<void> {
-  const startedAt = Date.now();
-  while (Date.now() - startedAt < timeoutMs) {
-    if ((await getBluezBoolean(properties, interfaceName, propertyName)) === expected) return;
-    await delay(250);
-  }
-  throw new Error(`Timed out after ${timeoutMs}ms waiting for BlueZ ${propertyName}=${expected}.`);
-}
-
-async function writeBluezValueWithRetry(characteristic: BluezCharacteristic, value: number[], options: Record<string, unknown>): Promise<void> {
-  let lastError: unknown;
-  for (let attempt = 0; attempt < 12; attempt += 1) {
-    try {
-      await characteristic.WriteValue(value, options);
-      return;
-    } catch (error) {
-      lastError = error;
-      if (!isBluezInProgressError(error)) throw error;
-      await delay(80);
-    }
-  }
-  throw lastError instanceof Error ? lastError : new Error(String(lastError));
-}
-
-function isBluezInProgressError(error: unknown): boolean {
-  const message = errorMessage(error).toLowerCase();
-  return message.includes('in progress') || message.includes('inprogress');
-}
-
-function withTimeout<T>(promise: Promise<T>, timeoutMs: number, label: string): Promise<T> {
-  return new Promise<T>((resolve, reject) => {
-    const timeout = setTimeout(() => reject(new Error(`Timed out after ${timeoutMs}ms during ${label}.`)), timeoutMs);
-    promise.then(
-      (value) => {
-        clearTimeout(timeout);
-        resolve(value);
-      },
-      (error) => {
-        clearTimeout(timeout);
-        reject(error);
-      }
-    );
-  });
-}
-
-async function shutdownBluez(): Promise<void> {
-  const sessions = [...activeSessions];
-  activeSessions = new Set();
-  await Promise.all(sessions.map((session) => session.disconnect().catch(() => {})));
+function deviceKey(device: BleDiscoveredDevice): string {
+  return device.address?.toLowerCase() || device.name || `${device.backend}:${device.id}`;
 }
 
 function loadDbusNext(): { systemBus: () => BluezBus; Variant: BluezVariantConstructor } {

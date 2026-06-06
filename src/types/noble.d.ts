@@ -4,6 +4,7 @@ declare module '@abandonware/noble' {
   export interface NobleAdvertisement {
     localName?: string;
     serviceUuids?: string[];
+    manufacturerData?: Buffer;
   }
 
   export interface NobleCharacteristic extends EventEmitter {

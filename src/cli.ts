@@ -1,14 +1,13 @@
 import { Command, Option } from 'commander';
 import { setTimeout as delay } from 'node:timers/promises';
 
-import { DEFAULTS, connectReaders, discoverDevices, readDevices, shutdownBluetooth, type BleReader, type BluetoothBackendName, type ReadOptions } from './index.js';
+import { DEFAULTS, discoverDevices, readDevices, shutdownBluetooth, type BluetoothBackendName, type ReadOptions } from './index.js';
 
 type Logger = (message: string) => void;
 
 interface GlobalCliOptions {
   bluetooth: BluetoothBackendName;
   namePrefix: string;
-  notifyUuid: string;
   serviceUuid?: string;
   listenMs: string;
   debug?: boolean;
@@ -24,7 +23,7 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
   const program = new Command();
   program
     .name('ble-reader')
-    .description('Discover BLE devices and read raw notification messages.')
+    .description('Discover BLE devices and read raw advertisement manufacturer data.')
     .showHelpAfterError();
   addSharedOptions(program);
 
@@ -47,9 +46,9 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
   addSharedOptions(
     program
       .command('read')
-      .description('Read raw notifications from one exact advertised device name, or all discovered matching devices.')
+      .description('Read raw advertisement manufacturer data from one exact advertised device name, or all matching devices.')
       .argument('[deviceName]', 'exact advertised BLE device name')
-      .option('--interval <seconds>', 'read repeatedly every N seconds using persistent BLE sessions')
+      .option('--interval <seconds>', 'read repeatedly every N seconds')
   ).action(async (deviceName: string | undefined, options: Partial<ReadCliOptions>, command: Command) => {
     const globals = globalOptions(command, options);
     const intervalMs = parseIntervalMs(options.interval);
@@ -87,7 +86,6 @@ export function toReadOptions(globals: GlobalCliOptions, deviceName?: string): R
     bluetooth: globals.bluetooth,
     namePrefix: globals.namePrefix,
     deviceName: deviceName || undefined,
-    notifyUuid: globals.notifyUuid,
     listenMs: parseListenMs(globals.listenMs),
     scanServiceUuid: globals.serviceUuid || null,
     matchServiceUuid: globals.serviceUuid || null,
@@ -100,8 +98,7 @@ function addSharedOptions(command: Command): Command {
     .addOption(new Option('--bluetooth <backend>', 'Bluetooth backend').choices(['auto', 'bluez', 'noble']).default('auto'))
     .option('--name-prefix <prefix>', 'BLE advertised name prefix; empty matches all devices', DEFAULTS.namePrefix)
     .option('--service-uuid <uuid>', 'optional BLE service UUID used for discovery filtering')
-    .option('--notify-uuid <uuid>', 'notification characteristic UUID to subscribe to', DEFAULTS.notifyUuid)
-    .option('--listen-ms <ms>', 'milliseconds to collect notifications per read', String(DEFAULTS.listenMs))
+    .option('--listen-ms <ms>', 'milliseconds to collect advertisements per read', String(DEFAULTS.listenMs))
     .option('--debug', 'print Bluetooth diagnostics to stderr');
 }
 
@@ -110,7 +107,6 @@ function globalOptions(command: Command, options: Partial<GlobalCliOptions>): Gl
     bluetooth: optionValue(command, options, 'bluetooth', 'auto'),
     namePrefix: optionValue(command, options, 'namePrefix', DEFAULTS.namePrefix),
     serviceUuid: optionValue(command, options, 'serviceUuid', ''),
-    notifyUuid: optionValue(command, options, 'notifyUuid', DEFAULTS.notifyUuid),
     listenMs: optionValue(command, options, 'listenMs', String(DEFAULTS.listenMs)),
     debug: optionValue(command, options, 'debug', false)
   };
@@ -134,26 +130,10 @@ async function writeJson(value: unknown): Promise<void> {
 }
 
 async function readAtInterval(globals: GlobalCliOptions, deviceName: string | undefined, intervalMs: number): Promise<void> {
-  const readers = await connectReaders(toReadOptions(globals, deviceName));
-  if (readers.length === 0) {
-    await writeJson([]);
-    return;
+  while (true) {
+    await writeJson(await readDevices(toReadOptions(globals, deviceName)));
+    await delay(intervalMs);
   }
-
-  try {
-    while (true) {
-      await writeJson(await readPersistentReaders(readers, globals));
-      await delay(intervalMs);
-    }
-  } finally {
-    await Promise.all(readers.map((reader) => reader.disconnect().catch(() => {})));
-  }
-}
-
-async function readPersistentReaders(readers: BleReader[], globals: GlobalCliOptions) {
-  const readings = [];
-  for (const reader of readers) readings.push(await reader.read(toReadOptions(globals)));
-  return readings;
 }
 
 function installSignalCleanup(): void {

@@ -1,26 +1,15 @@
-import { setTimeout as delay } from 'node:timers/promises';
-
 import { DEFAULTS } from './constants.js';
 import { bluezBackend } from './ble/bluez.js';
 import { nobleBackend } from './ble/noble.js';
-import { displayDevice, normalizeUuid } from './ble/utils.js';
 import type {
+  BleAdvertisement,
   BleDiscoveredDevice,
   BleReading,
-  BleSession,
   BluetoothBackend,
   BluetoothBackendName,
   DiscoverOptions,
-  RawBleMessage,
-  ReadOptions,
-  ResolvedBluetoothBackendName
+  ReadOptions
 } from './ble/backend.js';
-
-export interface BleReader {
-  device: BleDiscoveredDevice;
-  read(options?: ReadOptions): Promise<BleReading>;
-  disconnect(): Promise<void>;
-}
 
 export async function discoverDevices(options: DiscoverOptions = {}): Promise<BleDiscoveredDevice[]> {
   const logger = options.logger || (() => {});
@@ -46,103 +35,54 @@ export async function discoverDevices(options: DiscoverOptions = {}): Promise<Bl
 
 export async function readDevices(options: ReadOptions = {}): Promise<BleReading[]> {
   const logger = options.logger || (() => {});
-  const devices = await discoverDevices({ ...options, logger });
-  const readings: BleReading[] = [];
+  const bluetooth = options.bluetooth || 'auto';
+  const backend = await selectBluetoothBackend(bluetooth, logger);
+  const byDevice = new Map<string, BleReading>();
 
-  for (const device of devices) {
-    logger(`Reading raw BLE notifications from ${displayDevice(device)}.`);
-    readings.push(await readDevice(device, { ...options, logger }));
+  try {
+    await backend.scanAdvertisements({
+      namePrefix: options.namePrefix ?? DEFAULTS.namePrefix,
+      deviceName: options.deviceName || null,
+      timeoutMs: options.timeoutMs || DEFAULTS.timeoutMs,
+      listenMs: options.listenMs ?? DEFAULTS.listenMs,
+      scanServiceUuid: options.scanServiceUuid ?? null,
+      matchServiceUuid: options.matchServiceUuid ?? null,
+      logger,
+      onAdvertisement: (advertisement) => {
+        const reading = readingForAdvertisement(byDevice, advertisement);
+        reading.messages.push(advertisement.message);
+        logger(
+          `BLE manufacturer data ${advertisement.message.companyIdHex}:${advertisement.message.hex} ` +
+            `(${advertisement.message.length} byte${advertisement.message.length === 1 ? '' : 's'}).`
+        );
+      }
+    });
+  } catch (error) {
+    if (bluetooth === 'auto' && isBluetoothUnavailableError(error)) {
+      logger(`No usable Bluetooth backend found: ${error instanceof Error ? error.message : String(error)}.`);
+      return [];
+    }
+    throw error;
   }
 
-  return readings;
+  return [...byDevice.values()].sort((left, right) => displayReading(left).localeCompare(displayReading(right)));
 }
 
 export async function readDevice(device: BleDiscoveredDevice, options: ReadOptions = {}): Promise<BleReading> {
-  const reader = await connectDevice(device, options);
-  try {
-    return await reader.read(options);
-  } finally {
-    await reader.disconnect().catch(() => {});
-  }
-}
-
-export async function connectReaders(options: ReadOptions = {}): Promise<BleReader[]> {
-  const logger = options.logger || (() => {});
-  const devices = await discoverDevices({ ...options, logger });
-  const readers: BleReader[] = [];
-
-  try {
-    for (const device of devices) {
-      logger(`Connecting ${displayDevice(device)}.`);
-      readers.push(await connectDevice(device, { ...options, logger }));
-    }
-    return readers;
-  } catch (error) {
-    await Promise.all(readers.map((reader) => reader.disconnect().catch(() => {})));
-    throw error;
-  }
-}
-
-export async function connectDevice(device: BleDiscoveredDevice, options: ReadOptions = {}): Promise<BleReader> {
-  const logger = options.logger || (() => {});
-  const backend = backendForDevice(device);
-  const notifyUuid = normalizeUuid(options.notifyUuid || DEFAULTS.notifyUuid);
-  const session = await backend.connect({
-    device,
-    timeoutMs: options.timeoutMs || DEFAULTS.timeoutMs,
-    connectTimeoutMs: options.connectTimeoutMs || DEFAULTS.connectTimeoutMs,
-    notifyUuid,
-    logger
+  const readings = await readDevices({
+    ...options,
+    bluetooth: device.backend,
+    namePrefix: '',
+    deviceName: device.name || undefined
   });
-
-  let disconnected = false;
-
-  return {
-    device: session.device,
-    read: (readOptions) => readSession(session, { ...options, ...readOptions, notifyUuid, logger }),
-    disconnect: async () => {
-      if (disconnected) return;
-      disconnected = true;
-      await session.disconnect();
-    }
-  };
-}
-
-export async function readSession(session: BleSession, options: ReadOptions = {}): Promise<BleReading> {
-  const logger = options.logger || (() => {});
-  const listenMs = options.listenMs ?? DEFAULTS.listenMs;
-  const notifyUuid = normalizeUuid(options.notifyUuid || session.notify.uuid || DEFAULTS.notifyUuid);
-  const messages: RawBleMessage[] = [];
-
-  const onData = (data: Buffer) => {
-    const raw = Buffer.from(data);
-    const message: RawBleMessage = {
+  const match = readings.find((reading) => sameDevice(reading.device, device));
+  return (
+    match || {
+      device,
       timestamp: new Date().toISOString(),
-      uuid: session.notify.uuid,
-      length: raw.length,
-      data: raw,
-      hex: raw.toString('hex'),
-      base64: raw.toString('base64'),
-      bytes: [...raw]
-    };
-    logger(`BLE notification ${message.hex} (${message.length} byte${message.length === 1 ? '' : 's'}).`);
-    messages.push(message);
-  };
-
-  session.notify.onData(onData);
-  try {
-    logger(`Listening for ${listenMs}ms on characteristic ${notifyUuid}.`);
-    await delay(listenMs);
-  } finally {
-    session.notify.removeDataListener(onData);
-  }
-
-  return {
-    device: session.device,
-    timestamp: new Date().toISOString(),
-    notifyUuid,
-    messages
-  };
+      messages: []
+    }
+  );
 }
 
 export async function shutdownBluetooth(): Promise<void> {
@@ -156,12 +96,38 @@ async function selectBluetoothBackend(bluetooth: BluetoothBackendName, logger: (
   return nobleBackend;
 }
 
-function backendForDevice(device: BleDiscoveredDevice): BluetoothBackend {
-  const backends: Record<ResolvedBluetoothBackendName, BluetoothBackend> = {
-    bluez: bluezBackend,
-    noble: nobleBackend
+function readingForAdvertisement(readings: Map<string, BleReading>, advertisement: BleAdvertisement): BleReading {
+  const key = deviceKey(advertisement.device);
+  const existing = readings.get(key);
+  if (existing) {
+    existing.device = advertisement.device;
+    existing.timestamp = advertisement.message.timestamp;
+    return existing;
+  }
+
+  const reading: BleReading = {
+    device: advertisement.device,
+    timestamp: advertisement.message.timestamp,
+    messages: []
   };
-  return backends[device.backend];
+  readings.set(key, reading);
+  return reading;
+}
+
+function sameDevice(left: BleDiscoveredDevice, right: BleDiscoveredDevice): boolean {
+  return (
+    left.id === right.id ||
+    (!!left.address && !!right.address && left.address.toLowerCase() === right.address.toLowerCase()) ||
+    (!!left.name && !!right.name && left.name === right.name)
+  );
+}
+
+function deviceKey(device: BleDiscoveredDevice): string {
+  return device.address?.toLowerCase() || device.name || `${device.backend}:${device.id}`;
+}
+
+function displayReading(reading: BleReading): string {
+  return reading.device.name || reading.device.address || reading.device.id;
 }
 
 function isBluetoothUnavailableError(error: unknown): boolean {
